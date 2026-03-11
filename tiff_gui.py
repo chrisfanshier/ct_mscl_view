@@ -9,7 +9,7 @@ from PIL import Image
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QHBoxLayout, QPushButton, QFileDialog, QListWidget,
                                QListWidgetItem, QLabel, QScrollArea, QCheckBox, QFrame,
-                               QComboBox, QSlider, QSizePolicy, QSpinBox)
+                               QComboBox, QSlider, QSizePolicy, QSpinBox, QLineEdit)
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QPixmap, QImage, QWheelEvent
 
@@ -268,6 +268,7 @@ class CoreCollectorApp(QMainWindow):
         self.zoom_factor  = 1.0
         self.mscl_data    = None
         self.mscl_columns = []
+        self.mscl_col_rows = {}    # col_name -> {'check', 'min_edit', 'max_edit'}
 
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -308,10 +309,15 @@ class CoreCollectorApp(QMainWindow):
         self.mscl_width_slider.setEnabled(False)
         self.mscl_width_slider.valueChanged.connect(self._on_mscl_width_changed)
 
-        self.mscl_col_list = QListWidget()
-        self.mscl_col_list.setMaximumHeight(130)
-        self.mscl_col_list.setEnabled(False)
-        self.mscl_col_list.itemChanged.connect(self.update_previews)
+        self._mscl_col_inner   = QWidget()
+        self._mscl_col_vlayout = QVBoxLayout(self._mscl_col_inner)
+        self._mscl_col_vlayout.setContentsMargins(2, 2, 2, 2)
+        self._mscl_col_vlayout.setSpacing(2)
+        self.mscl_col_scroll = QScrollArea()
+        self.mscl_col_scroll.setWidget(self._mscl_col_inner)
+        self.mscl_col_scroll.setWidgetResizable(True)
+        self.mscl_col_scroll.setMaximumHeight(160)
+        self.mscl_col_scroll.setEnabled(False)
 
         # Export options (restored from v1)
         exp_lbl = QLabel("── Export Options ──")
@@ -352,8 +358,8 @@ class CoreCollectorApp(QMainWindow):
         mscl_w_row.addWidget(self.mscl_width_label)
         mscl_w_row.addWidget(self.mscl_width_slider)
         left_panel.addLayout(mscl_w_row)
-        left_panel.addWidget(QLabel("MSCL Columns:"))
-        left_panel.addWidget(self.mscl_col_list)
+        left_panel.addWidget(QLabel("MSCL Columns (checkbox  min  max):"))
+        left_panel.addWidget(self.mscl_col_scroll)
         left_panel.addWidget(QLabel(""))
         left_panel.addWidget(exp_lbl)
         ts_row = QHBoxLayout()
@@ -400,9 +406,51 @@ class CoreCollectorApp(QMainWindow):
         self.update_previews()
 
     def get_selected_mscl_columns(self):
-        return [self.mscl_col_list.item(i).text()
-                for i in range(self.mscl_col_list.count())
-                if self.mscl_col_list.item(i).checkState() == Qt.Checked]
+        return [col for col, row in self.mscl_col_rows.items()
+                if row['check'].isChecked()]
+
+    def _get_mscl_ranges(self, checked_items, selected_cols):
+        """Compute global x-axis (value) ranges for each MSCL column across
+        all displayed sections.  User-supplied min/max fields override the
+        auto range.  Returns {col_name: (v_lo, v_hi)}.
+        """
+        ranges = {}
+        if self.mscl_data is None:
+            return ranges
+        for col_name in selected_cols:
+            all_vals = []
+            for item in checked_items:
+                sec_num  = item['meta']['section_number']
+                sec_data = self.mscl_data.get(sec_num)
+                if sec_data and col_name in sec_data:
+                    vals = sec_data[col_name]
+                    all_vals.append(vals[~np.isnan(vals)])
+            if not all_vals:
+                continue
+            combined = np.concatenate(all_vals)
+            if len(combined) < 2:
+                continue
+            v_lo, v_hi = np.percentile(combined, (2, 98))
+            if v_hi <= v_lo:
+                v_lo, v_hi = combined.min(), combined.max()
+            if v_hi <= v_lo:
+                continue
+            # Apply user overrides from the min/max input fields
+            row      = self.mscl_col_rows.get(col_name, {})
+            min_edit = row.get('min_edit')
+            max_edit = row.get('max_edit')
+            if min_edit:
+                try:
+                    v_lo = float(min_edit.text().strip())
+                except ValueError:
+                    pass
+            if max_edit:
+                try:
+                    v_hi = float(max_edit.text().strip())
+                except ValueError:
+                    pass
+            ranges[col_name] = (v_lo, v_hi)
+        return ranges
 
     # ── Directory / file loading ──────────────────────────────────────────
 
@@ -436,21 +484,44 @@ class CoreCollectorApp(QMainWindow):
             self.mscl_data    = None
             self.mscl_columns = []
             self.chk_mscl.setEnabled(False)
-            self.mscl_col_list.setEnabled(False)
+            self.mscl_col_scroll.setEnabled(False)
             self.mscl_width_slider.setEnabled(False)
             return
         self.mscl_data    = data
         self.mscl_columns = columns
-        self.mscl_col_list.blockSignals(True)
-        self.mscl_col_list.clear()
+        # Rebuild custom column rows
+        self.mscl_col_rows = {}
+        while self._mscl_col_vlayout.count():
+            child = self._mscl_col_vlayout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
         for col in columns:
-            li = QListWidgetItem(col)
-            li.setFlags(li.flags() | Qt.ItemIsUserCheckable)
-            li.setCheckState(Qt.Checked if col == "Den1" else Qt.Unchecked)
-            self.mscl_col_list.addItem(li)
-        self.mscl_col_list.blockSignals(False)
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
+            chk = QCheckBox(col)
+            chk.setChecked(col == "Den1")
+            chk.stateChanged.connect(self.update_previews)
+            min_edit = QLineEdit()
+            min_edit.setPlaceholderText("auto")
+            min_edit.setFixedWidth(52)
+            min_edit.editingFinished.connect(self.update_previews)
+            max_edit = QLineEdit()
+            max_edit.setPlaceholderText("auto")
+            max_edit.setFixedWidth(52)
+            max_edit.editingFinished.connect(self.update_previews)
+            row_layout.addWidget(chk)
+            row_layout.addStretch()
+            row_layout.addWidget(QLabel("min"))
+            row_layout.addWidget(min_edit)
+            row_layout.addWidget(QLabel("max"))
+            row_layout.addWidget(max_edit)
+            self._mscl_col_vlayout.addWidget(row_widget)
+            self.mscl_col_rows[col] = {'check': chk, 'min_edit': min_edit, 'max_edit': max_edit}
+        self._mscl_col_vlayout.addStretch()
         self.chk_mscl.setEnabled(True)
-        self.mscl_col_list.setEnabled(True)
+        self.mscl_col_scroll.setEnabled(True)
         self.mscl_width_slider.setEnabled(True)
         self.chk_mscl.setChecked(True)
         self.btn_mscl.setText(f"MSCL: {Path(fp).name}")
@@ -477,8 +548,16 @@ class CoreCollectorApp(QMainWindow):
         if show_scale and not per_section:
             self._add_standalone_scale(checked)
 
+        # Compute global MSCL ranges once across all displayed sections
+        mscl_ranges = {}
+        selected_cols = self.get_selected_mscl_columns()
+        if (self.mscl_data is not None and self.chk_mscl.isChecked()
+                and selected_cols):
+            mscl_ranges = self._get_mscl_ranges(checked, selected_cols)
+
         for item in checked:
-            self.add_thumbnail(item, draw_scale=(show_scale and per_section))
+            self.add_thumbnail(item, draw_scale=(show_scale and per_section),
+                               mscl_ranges=mscl_ranges)
 
     def _add_standalone_scale(self, checked_items):
         """Standalone depth scale shown once to the left of all thumbnails."""
@@ -521,7 +600,7 @@ class CoreCollectorApp(QMainWindow):
         lbl.setPixmap(QPixmap.fromImage(qimg.copy()))
         self.preview_layout.addWidget(lbl, 0, Qt.AlignTop)
 
-    def _render_mscl_plot_pil(self, series_list, plot_w, plot_h, preview_px_per_cm):
+    def _render_mscl_plot_pil(self, series_list, plot_w, plot_h, preview_px_per_cm, ranges=None):
         """
         Render MSCL series as a vertical PIL image.
         Depths are SECT DEPTH (0 = physical section top).
@@ -540,9 +619,12 @@ class CoreCollectorApp(QMainWindow):
 
         names = []
         for col_name, depths, values, color in series_list:
-            v_lo, v_hi = np.percentile(values, (2, 98))
-            if v_hi <= v_lo:
-                v_lo, v_hi = values.min(), values.max()
+            if ranges and col_name in ranges:
+                v_lo, v_hi = ranges[col_name]
+            else:
+                v_lo, v_hi = np.percentile(values, (2, 98))
+                if v_hi <= v_lo:
+                    v_lo, v_hi = values.min(), values.max()
             if v_hi <= v_lo:
                 continue
 
@@ -570,7 +652,7 @@ class CoreCollectorApp(QMainWindow):
 
         return img
 
-    def add_thumbnail(self, data, draw_scale=True):
+    def add_thumbnail(self, data, draw_scale=True, mscl_ranges=None):
         from PIL import ImageDraw
 
         px_per_cm = data['meta']['px_per_cm']
@@ -609,7 +691,8 @@ class CoreCollectorApp(QMainWindow):
                                             MSCL_COLORS_PIL[ci % len(MSCL_COLORS_PIL)]))
                 if series_list:
                     mscl_plot = self._render_mscl_plot_pil(
-                        series_list, mscl_w, canvas_h, preview_px_per_cm)
+                        series_list, mscl_w, canvas_h, preview_px_per_cm,
+                        ranges=mscl_ranges)
 
         LABEL_H   = max(28, int(40 * self.zoom_factor))  # Increased label height
         SCALEBAR_W = int(45 * self.zoom_factor) if draw_scale else 0
@@ -720,7 +803,7 @@ class CoreCollectorApp(QMainWindow):
             tick += 1
 
     def _draw_mscl_plot_pdf(self, c, x, top_y, plot_w_pt, plot_h_pt,
-                             section_num, full_phys_h_cm):
+                             section_num, full_phys_h_cm, ranges=None):
         """
         Draw MSCL series on the PDF canvas.
         top_y is the PDF y of the physical section top (depth = 0 cm).
@@ -752,9 +835,12 @@ class CoreCollectorApp(QMainWindow):
             if mask.sum() < 2:
                 continue
             d, v = depths[mask], values[mask]
-            v_lo, v_hi = np.percentile(v, (2, 98))
-            if v_hi <= v_lo:
-                v_lo, v_hi = v.min(), v.max()
+            if ranges and col_name in ranges:
+                v_lo, v_hi = ranges[col_name]
+            else:
+                v_lo, v_hi = np.percentile(v, (2, 98))
+                if v_hi <= v_lo:
+                    v_lo, v_hi = v.min(), v.max()
             if v_hi <= v_lo:
                 continue
 
@@ -876,13 +962,20 @@ class CoreCollectorApp(QMainWindow):
         label_font_size = max(8, title_font_size - 4)
         cur_x = SCALE_WIDTH
 
+        # Compute global MSCL ranges for PDF export
+        mscl_ranges_pdf = {}
+        if show_mscl_pdf:
+            mscl_ranges_pdf = self._get_mscl_ranges(
+                items, self.get_selected_mscl_columns())
+
         for im in processed:
             # MSCL plot to the left of the image
             if show_mscl_pdf:
                 self._draw_mscl_plot_pdf(
                     c, cur_x, top_y,
                     im['mscl_pt_w'], im['pt_h_full'],
-                    im['sec'], im['full_phys_h_cm'])
+                    im['sec'], im['full_phys_h_cm'],
+                    ranges=mscl_ranges_pdf)
                 cur_x += im['mscl_pt_w']
 
             # Image pasted at its correct physical offset within the full canvas
